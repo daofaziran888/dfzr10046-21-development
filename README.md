@@ -81,5 +81,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 影响链工作队列
+
+血缘关系模块追踪一条影响链上待接手节点的工作队列，与重跑任务模块共享同一份待办：
+
+- `GET /api/impact-chain/chains?upstream=<对象>`：下游处置筛选，值班人从上游对象选择一条实际影响链（分叉后汇合的链会产出多条路径）。
+- `POST /api/impact-chain/claim`：沿选中的影响链跨模块申请领取，链上每个下游节点在重跑任务生成一份待办；两条路径并发提交时汇合节点只生成一份待办。
+- `POST /api/impact-chain/revoke`：撤销一条来路；已领取任务说明从哪条有效路径继续，撤销最后一条来路后节点止领、停止新的领取。
+- `POST /api/impact-chain/confirm`：接手人从重跑页确认实际节点，再回原队列处理未覆盖节点。
+- `POST /api/impact-chain/resolve`：取消最后路径与在途排期（待排期未开跑）冲突时，两边确认
+  `complete_last_path`（按最后一次有效路径完成这轮排期）或
+  `withdraw_slot`（撤回名额等新路径）；任一决定都不会启动两份任务。
+- `GET /api/impact-chain/queue` / `GET /api/impact-chain/todos`：原队列快照（待办数量、未覆盖节点）与重跑页待办节点。
+
+核心状态机在 `backend/app/pipeline/impact_chain_queue.py`，服务层经
+`app/services/impact_queue.py` 的单例共享队列，场景覆盖见
+`backend/tests/test_impact_chain_queue.py`。
+
 领域：数据工程
 子方向：数仓与数据湖

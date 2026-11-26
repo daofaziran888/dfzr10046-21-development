@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.pipeline.impact_chain_queue import ImpactChainQueue
 from app.services.base import BaseModuleService
+from app.services.impact_queue import IMPACT_QUEUE
 from app.store import store
 
 
@@ -58,3 +60,89 @@ class LineageEdgeService(BaseModuleService):
             if not current:
                 break
         return result
+
+    # ------------------------------------------------------------------
+    # 影响链工作队列：下游处置筛选 → 跨模块领取 → 来路撤销
+    # ------------------------------------------------------------------
+    def list_impact_chains(self, upstream: str) -> tuple[bool, str, list[list[str]]]:
+        """下游处置筛选：值班人从上游对象选择一条实际影响链。
+
+        只沿未失效的血缘边枚举路径；分叉后汇合的链会产出多条可选路径。
+        """
+        upstream = str(upstream or "").strip()
+        if not upstream:
+            return False, "请先指定上游对象", []
+        edges = [
+            {"upstream": str(r.get("上游对象", "")),
+             "downstream": str(r.get("下游对象", ""))}
+            for r in store.rows(self.MODULE)
+            if r.get("status") != "已失效"
+        ]
+        chains = ImpactChainQueue.select_impact_chains(upstream, edges)
+        if not chains:
+            return False, f"上游对象 {upstream} 没有可用的实际影响链", []
+        return True, f"上游对象 {upstream} 共 {len(chains)} 条实际影响链", chains
+
+    def claim_impact_chain(
+        self, path: list[str], applicant: str = "on_duty",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """跨模块申请：沿影响链领取待接手节点，在重跑任务侧生成待办。
+
+        两条路径并发提交时汇合节点只生成一份待办；已生成的待办同步写入
+        重跑任务数据集，接手人从重跑页确认实际节点。
+        """
+        ok, message, detail = IMPACT_QUEUE.claim_chain(path, applicant)
+        if not ok:
+            return False, message, detail
+        rerun_rows = store.rows("reprocess_task")
+        for item in detail.get("results", []):
+            if not (item.get("ok") and item.get("todo_created")):
+                continue
+            todo = IMPACT_QUEUE.get_todo(item["todo_id"])
+            if todo is None:
+                continue
+            entry = {
+                "重跑编号": todo["todo_id"], "触发原因": "影响链处置",
+                "影响事实表": todo["node"],
+                "重跑区间": "-", "覆盖策略": "并存留痕",
+                "依赖批次": "->".join(todo["active_path"]),
+                "重跑水位": "", "重跑耗时": "",
+                "status": "待排期", "pending": True, "abnormal": False,
+            }
+            entry["id"] = max((int(r.get("id", 0)) for r in rerun_rows), default=0) + 1
+            rerun_rows.append(entry)
+        return True, message, detail
+
+    def revoke_impact_chain(self, path: list[str]) -> tuple[bool, str, dict[str, Any]]:
+        """撤销一条来路：已领取任务说明从哪条有效路径继续。
+
+        撤销最后一条来路后节点止领、停止新的领取；若在途排期尚未开跑，
+        冲突交给重跑页裁决，裁决结果同步回重跑任务数据集。
+        """
+        ok, message, detail = IMPACT_QUEUE.revoke_chain(path)
+        if not ok:
+            return False, message, detail
+        self._sync_rerun_rows(detail.get("events", []))
+        return True, message, detail
+
+    def impact_queue_status(self) -> dict[str, Any]:
+        """原队列快照：各节点状态、待办数量与未覆盖节点。"""
+        return IMPACT_QUEUE.queue_snapshot()
+
+    @staticmethod
+    def _sync_rerun_rows(events: list[dict[str, Any]]) -> None:
+        """把撤销引起的待办变化同步到重跑任务数据集（如挂起在途排期）。"""
+        rerun_rows = store.rows("reprocess_task")
+        for event in events:
+            todo_id = event.get("todo_id")
+            if not todo_id:
+                continue
+            todo = IMPACT_QUEUE.get_todo(todo_id)
+            if todo is None:
+                continue
+            for row in rerun_rows:
+                if row.get("重跑编号") == todo_id:
+                    row["status"] = todo["status"]
+                    row["pending"] = todo["status"] not in ("已完成", "已撤回")
+                    if todo.get("held"):
+                        row["abnormal"] = True

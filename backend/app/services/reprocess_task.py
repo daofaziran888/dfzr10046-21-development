@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.impact_queue import IMPACT_QUEUE
 from app.store import store
 
 
@@ -62,3 +63,46 @@ class ReprocessTaskService(BaseModuleService):
                 r["pending"] = False
                 return True, f"重跑任务 {task_id} 已完成，水位 {watermark}"
         return False, f"重跑任务 {task_id} 不存在"
+
+    # ------------------------------------------------------------------
+    # 影响链待办：接手人确认与在途排期冲突裁决
+    # ------------------------------------------------------------------
+    def impact_todos(self) -> list[dict[str, Any]]:
+        """重跑页得到的影响链待办节点：未撤回的在途任务，同一节点只有一份。"""
+        return IMPACT_QUEUE.rerun_todos()
+
+    def confirm_impact_node(self, node: str, operator: str) -> tuple[bool, str]:
+        """接手人从重跑页确认实际节点，同步重跑任务记录状态。"""
+        ok, message = IMPACT_QUEUE.confirm_node(node, operator)
+        if ok:
+            self._sync_todo_row(node)
+        return ok, message
+
+    def resolve_schedule_conflict(self, node: str, decision: str) -> tuple[bool, str]:
+        """裁决取消最后路径与在途排期的冲突。
+
+        complete_last_path：按最后一次有效路径完成这轮排期；
+        withdraw_slot：撤回名额等新路径。两种决定都不会启动两份任务。
+        """
+        ok, message = IMPACT_QUEUE.resolve_conflict(node, decision)
+        if ok:
+            self._sync_todo_row(node)
+        return ok, message
+
+    @staticmethod
+    def _sync_todo_row(node: str) -> None:
+        """把队列里的待办状态回写到重跑任务数据集。"""
+        todo = IMPACT_QUEUE.todo_for_node(node)
+        if todo is None:
+            # 名额已撤回：把对应的重跑记录标记为已撤回
+            for row in store.rows("reprocess_task"):
+                if row.get("影响事实表") == node and row.get("触发原因") == "影响链处置" \
+                        and row.get("status") not in ("已完成", "已撤回"):
+                    row["status"] = "已撤回"
+                    row["pending"] = False
+            return
+        for row in store.rows("reprocess_task"):
+            if row.get("重跑编号") == todo["todo_id"]:
+                row["status"] = todo["status"]
+                row["pending"] = todo["status"] not in ("已完成", "已撤回")
+                row["abnormal"] = bool(todo.get("held"))
